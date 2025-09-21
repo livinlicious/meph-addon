@@ -1,8 +1,9 @@
 --[[
-    MEPH FINAL: Simple Movement Disabler
+    MEPH IMPROVED: Simple Movement Disabler with Emergency Restore
     
     Simple system to disable movement keys when specific units cast specific spells.
     Waits for player to be stationary, then disables keys until debuff is gone.
+    Added: Emergency restore timer to prevent permanent key lockouts.
 --]]
 
 DEFAULT_CHAT_FRAME:AddMessage("MEPH: Loading movement disabler...")
@@ -25,6 +26,7 @@ end
 local CAST_TIME = 3.0
 local GRACE_PERIOD = 0.5
 local DEBUG_MODE = true
+local EMERGENCY_RESTORE_TIME = 12.0  -- Emergency restore after 12 seconds
 
 -- Movement actions to look for
 local MOVEMENT_ACTIONS = {
@@ -55,6 +57,7 @@ local keysDisabled = false
 local debuffScanFrame = nil
 local stationaryStartTime = nil
 local currentConfig = nil
+local emergencyRestoreTimer = nil  -- New: Emergency restore timer
 
 -- Debug function
 local function DebugMsg(msg)
@@ -157,7 +160,13 @@ local function DisableMovementKeys()
     SaveBindings(2)
     
     keysDisabled = true
-    DEFAULT_CHAT_FRAME:AddMessage("MEPH: Movement keys DISABLED! Player stationary for " .. string.format("%.1f", stationaryDuration) .. "s")
+    DEFAULT_CHAT_FRAME:AddMessage("MEPH: Movement keys DISABLED!")
+    
+    -- NEW: Start emergency restore timer
+    emergencyRestoreTimer = CreateSimpleTimer(EMERGENCY_RESTORE_TIME, function()
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: EMERGENCY RESTORE! Keys disabled for " .. EMERGENCY_RESTORE_TIME .. " seconds!")
+        RestoreMovementKeys()
+    end)
     
     return true
 end
@@ -173,7 +182,14 @@ local function RestoreMovementKeys()
     
     keysDisabled = false
     originalBindings = {}
-    DEFAULT_CHAT_FRAME:AddMessage("MEPH: Movement keys RESTORED!")
+    
+    -- NEW: Cancel emergency restore timer if it exists
+    if emergencyRestoreTimer then
+        emergencyRestoreTimer:SetScript("OnUpdate", nil)
+        emergencyRestoreTimer = nil
+    end
+    
+    DEFAULT_CHAT_FRAME:AddMessage("MEPH: Movement keys RESTORED! YOU CAN MOVE!")
 end
 
 -- Debuff detection (working method)
@@ -208,13 +224,13 @@ local function StartDebuffScanning()
         debuffScanFrame:SetScript("OnUpdate", nil)
     end
     
-    DEFAULT_CHAT_FRAME:AddMessage("MEPH: Starting scan for debuff: " .. currentConfig.debuff)
+    DebugMsg("Starting scan for debuff: " .. currentConfig.debuff)
     
     debuffScanFrame = CreateFrame("Frame")
     local scanElapsed = 0
     local debuffWasFound = false
     local scanStartTime = GetTime()
-    local NO_DEBUFF_TIMEOUT = 1.0  -- If no debuff found after 1s, restore keys
+    local NO_DEBUFF_TIMEOUT = 1.5  -- Increased from 1.0 for better reliability
     
     debuffScanFrame:SetScript("OnUpdate", function()
         scanElapsed = scanElapsed + arg1
@@ -230,7 +246,7 @@ local function StartDebuffScanning()
             
             if hasDebuff then
                 if not debuffWasFound then
-                    DEFAULT_CHAT_FRAME:AddMessage("MEPH: " .. currentConfig.debuff .. " debuff detected!")
+                    DebugMsg(currentConfig.debuff .. " debuff detected!")
                     debuffWasFound = true
                 end
                 
@@ -242,7 +258,7 @@ local function StartDebuffScanning()
                 -- Debuff not found
                 if debuffWasFound then
                     -- Debuff was there but now gone
-                    DEFAULT_CHAT_FRAME:AddMessage("MEPH: " .. currentConfig.debuff .. " debuff GONE! Restoring keys...")
+                    DebugMsg(currentConfig.debuff .. " debuff GONE! Restoring keys...")
                     RestoreMovementKeys()
                     
                     -- Stop scanning
@@ -252,7 +268,7 @@ local function StartDebuffScanning()
                 else
                     -- Debuff was never found - check timeout
                     if totalScanTime >= NO_DEBUFF_TIMEOUT then
-                        DEFAULT_CHAT_FRAME:AddMessage("MEPH: No debuff found after " .. NO_DEBUFF_TIMEOUT .. "s (resisted?). Restoring keys...")
+                        DebugMsg("No debuff found after " .. NO_DEBUFF_TIMEOUT .. "s (resisted?). Restoring keys...")
                         RestoreMovementKeys()
                         
                         -- Stop scanning
@@ -272,7 +288,7 @@ local function OnTargetCastDetected(config)
     
     castInProgress = true
     currentConfig = config
-    DEFAULT_CHAT_FRAME:AddMessage("MEPH: " .. config.caster .. " casting " .. config.spell .. "! Starting monitoring...")
+    DEFAULT_CHAT_FRAME:AddMessage("MEPH: " .. config.caster .. " casting " .. config.spell .. "! STOP MOVING NOW!!!")
     
     -- Monitor during cast
     local castStartTime = GetTime()
@@ -317,7 +333,7 @@ local function OnChatMessage(event, message)
     for _, config in ipairs(targetConfigs) do
         if string.find(message, config.caster) and string.find(message, config.spell) then
             if string.find(message, "begins to cast") or string.find(message, "casts") then
-                DEFAULT_CHAT_FRAME:AddMessage("MEPH: CAST DETECTED: " .. message)
+                DebugMsg("CAST DETECTED: " .. message)
                 OnTargetCastDetected(config)
                 break
             end
@@ -411,6 +427,14 @@ SlashCmdList["MEPH"] = function(msg)
         else
             DEFAULT_CHAT_FRAME:AddMessage("MEPH: Invalid wait time. Use 0.1-3.0 seconds")
         end
+    elseif args[1] == "emergency" and args[2] then
+        local newTime = tonumber(args[2])
+        if newTime and newTime >= 5 and newTime <= 30 then
+            EMERGENCY_RESTORE_TIME = newTime
+            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Emergency restore time set to " .. newTime .. " seconds")
+        else
+            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Invalid emergency time. Use 5-30 seconds")
+        end
     elseif args[1] == "debug" then
         DEBUG_MODE = not DEBUG_MODE
         DEFAULT_CHAT_FRAME:AddMessage("MEPH: Debug mode " .. (DEBUG_MODE and "ON" or "OFF"))
@@ -439,6 +463,7 @@ SlashCmdList["MEPH"] = function(msg)
         DEFAULT_CHAT_FRAME:AddMessage('/meph target "caster" "spell" "debuff" - Add target')
         DEFAULT_CHAT_FRAME:AddMessage("/meph list - List targets")
         DEFAULT_CHAT_FRAME:AddMessage("/meph wait <seconds> - Set grace period")
+        DEFAULT_CHAT_FRAME:AddMessage("/meph emergency <seconds> - Set emergency restore time (5-30s)")
         DEFAULT_CHAT_FRAME:AddMessage("/meph debug - Toggle debug")
         DEFAULT_CHAT_FRAME:AddMessage("/meph test - Test detection")
         DEFAULT_CHAT_FRAME:AddMessage("/meph debuff - Check debuff")
@@ -468,6 +493,7 @@ frame:SetScript("OnEvent", function()
     if event == "PLAYER_LOGIN" then
         DEFAULT_CHAT_FRAME:AddMessage("MEPH: Loaded successfully!")
         DEFAULT_CHAT_FRAME:AddMessage("MEPH: Type /meph for commands")
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Emergency restore after " .. EMERGENCY_RESTORE_TIME .. " seconds")
         StoreOriginalBindings()
         ListTargetConfigs()
     else
