@@ -1,6 +1,6 @@
 ## Interface: 11200
 ## Title: Meph
-## Notes: Disables movement keys when Kara40 Mephistroth casts Shackles.
+## Notes: Disables movement keys when Kara40 Mephistroth casts Shackles. Testing-Options type /meph
 ## Version: 2.0
 ## Author: Livin
 ## SavedVariables: MephDB
