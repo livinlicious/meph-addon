@@ -31,7 +31,7 @@ end
 local CAST_TIME = 3.0
 local GRACE_PERIOD = 0.5
 local DEBUG_MODE = false
-local EMERGENCY_RESTORE_TIME = 12.0  -- Emergency restore after 12 seconds
+local EMERGENCY_RESTORE_TIME = 12.0  -- Emergency restore keys after this time no matter what
 
 -- Movement actions to look for
 local MOVEMENT_ACTIONS = {
@@ -125,6 +125,27 @@ local function StoreOriginalBindings()
     DebugMsg("Stored " .. table.getn(originalBindings) .. " movement key bindings")
 end
 
+-- Restore movement keys function
+local function RestoreMovementKeys()
+    if not keysDisabled then return end
+    
+    for key, action in pairs(originalBindings) do
+        SetBinding(key, action)
+    end
+    SaveBindings(2)
+    
+    keysDisabled = false
+    originalBindings = {}
+    
+    -- Cancel emergency restore timer if it exists
+    if emergencyRestoreTimer then
+        emergencyRestoreTimer:SetScript("OnUpdate", nil)
+        emergencyRestoreTimer = nil
+    end
+    
+    DEFAULT_CHAT_FRAME:AddMessage("MEPH: Movement keys RESTORED! YOU CAN MOVE!")
+end
+
 -- Disable movement keys
 local function DisableMovementKeys()
     if keysDisabled then return end
@@ -163,36 +184,23 @@ local function DisableMovementKeys()
     DEFAULT_CHAT_FRAME:AddMessage("MEPH: Movement keys DISABLED!")
     
     -- NEW: Start emergency restore timer
-    emergencyRestoreTimer = CreateSimpleTimer(EMERGENCY_RESTORE_TIME, function()
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: EMERGENCY RESTORE! Keys disabled for " .. EMERGENCY_RESTORE_TIME .. " seconds!")
+    local emergencyTime = EMERGENCY_RESTORE_TIME  -- Capture current value
+    emergencyRestoreTimer = CreateSimpleTimer(emergencyTime, function()
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: EMERGENCY RESTORE! Keys disabled for " .. emergencyTime .. " seconds!")
+        -- Emergency restore should stop all scanning and force restore
+        if debuffScanFrame then
+            debuffScanFrame:SetScript("OnUpdate", nil)
+        end
+        castInProgress = false
+        currentConfig = nil
         RestoreMovementKeys()
     end)
     
     return true
 end
 
--- Restore movement keys
-local function RestoreMovementKeys()
-    if not keysDisabled then return end
-    
-    for key, action in pairs(originalBindings) do
-        SetBinding(key, action)
-    end
-    SaveBindings(2)
-    
-    keysDisabled = false
-    originalBindings = {}
-    
-    -- NEW: Cancel emergency restore timer if it exists
-    if emergencyRestoreTimer then
-        emergencyRestoreTimer:SetScript("OnUpdate", nil)
-        emergencyRestoreTimer = nil
-    end
-    
-    DEFAULT_CHAT_FRAME:AddMessage("MEPH: Movement keys RESTORED! YOU CAN MOVE!")
-end
 
--- Debuff detection (working method)
+-- Debuff detection
 local tooltip = CreateFrame("GameTooltip", "MephTooltip", nil, "GameTooltipTemplate")
 tooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
 
@@ -348,7 +356,6 @@ local function OnChatMessage(event, message)
     end
 end
 
--- Settings are now saved automatically by WoW when MephDB is modified
 
 -- Load settings from saved variables and initialize defaults
 local function LoadSettings()
@@ -386,7 +393,7 @@ local function LoadSettings()
             CAST_TIME = 3.0,
             GRACE_PERIOD = 0.5,
             DEBUG_MODE = false,
-            EMERGENCY_RESTORE_TIME = 11.0
+            EMERGENCY_RESTORE_TIME = 9.0
         }
     end
     
@@ -398,8 +405,9 @@ local function LoadSettings()
     else
         DEBUG_MODE = false
     end
-    EMERGENCY_RESTORE_TIME = tonumber(MephDB.settings.EMERGENCY_RESTORE_TIME) or 11.0
+    EMERGENCY_RESTORE_TIME = tonumber(MephDB.settings.EMERGENCY_RESTORE_TIME) or 9.0
 end
+
 
 -- Add target configuration
 local function AddTargetConfig(caster, spell, debuff)
@@ -635,7 +643,7 @@ SlashCmdList["MEPH"] = function(msg)
     end
 end
 
--- Event frame with safer handling
+-- Event frame with safe handling
 local frame = CreateFrame("Frame", "MephEventFrame")
 
 -- Event handler function
@@ -678,6 +686,3 @@ frame:RegisterEvent("CHAT_MSG_RAID_BOSS_EMOTE")
 frame:RegisterEvent("CHAT_MSG_MONSTER_EMOTE")
 
 frame:SetScript("OnEvent", MephEventHandler)
-
--- Ready message removed to prevent reload crash
-
