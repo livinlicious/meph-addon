@@ -359,6 +359,9 @@ end
 
 -- Load settings from saved variables and initialize defaults
 local function LoadSettings()
+    -- DEBUG: Show what the hardcoded default is
+    DEFAULT_CHAT_FRAME:AddMessage("MEPH DEBUG: Hardcoded EMERGENCY_RESTORE_TIME = " .. EMERGENCY_RESTORE_TIME)
+    
     -- Ensure MephDB exists (SavedVariables might override our initial value)
     if not MephDB then
         MephDB = {}
@@ -392,8 +395,8 @@ local function LoadSettings()
         MephDB.settings = {
             CAST_TIME = 3.0,
             GRACE_PERIOD = 0.5,
-            DEBUG_MODE = false,
-            EMERGENCY_RESTORE_TIME = 9.0
+            DEBUG_MODE = false
+            -- EMERGENCY_RESTORE_TIME only added when user changes it
         }
     end
     
@@ -405,7 +408,15 @@ local function LoadSettings()
     else
         DEBUG_MODE = false
     end
-    EMERGENCY_RESTORE_TIME = tonumber(MephDB.settings.EMERGENCY_RESTORE_TIME) or 9.0
+    -- Use saved override or keep the hardcoded default
+    if MephDB.settings.EMERGENCY_RESTORE_TIME then
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH DEBUG: Found DB override = " .. MephDB.settings.EMERGENCY_RESTORE_TIME)
+        EMERGENCY_RESTORE_TIME = tonumber(MephDB.settings.EMERGENCY_RESTORE_TIME)
+    else
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH DEBUG: No DB override, using hardcoded default")
+    end
+    DEFAULT_CHAT_FRAME:AddMessage("MEPH DEBUG: Final EMERGENCY_RESTORE_TIME = " .. EMERGENCY_RESTORE_TIME)
+    -- If no override in DB, EMERGENCY_RESTORE_TIME keeps its hardcoded default value
 end
 
 
@@ -550,13 +561,21 @@ SlashCmdList["MEPH"] = function(msg)
             DEFAULT_CHAT_FRAME:AddMessage("MEPH: Addon not fully loaded yet. Please wait.")
             return
         end
-        local newTime = tonumber(args[2])
-        if newTime and newTime >= 5 and newTime <= 30 then
-            EMERGENCY_RESTORE_TIME = newTime
-            MephDB.settings.EMERGENCY_RESTORE_TIME = newTime
-            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Emergency restore time set to " .. newTime .. " seconds")
+        if args[2] == "reset" then
+            -- Remove the database override to use hardcoded default
+            MephDB.settings.EMERGENCY_RESTORE_TIME = nil
+            -- Reset to hardcoded default (reload the settings)
+            LoadSettings()
+            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Emergency restore time reset to default (" .. EMERGENCY_RESTORE_TIME .. " seconds)")
         else
-            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Invalid emergency time. Use 5-30 seconds")
+            local newTime = tonumber(args[2])
+            if newTime and newTime >= 5 and newTime <= 30 then
+                EMERGENCY_RESTORE_TIME = newTime
+                MephDB.settings.EMERGENCY_RESTORE_TIME = newTime
+                DEFAULT_CHAT_FRAME:AddMessage("MEPH: Emergency restore time set to " .. newTime .. " seconds")
+            else
+                DEFAULT_CHAT_FRAME:AddMessage("MEPH: Invalid emergency time. Use 5-30 seconds or 'reset'")
+            end
         end
     elseif args[1] == "debug" then
         if not addonLoaded then
@@ -633,6 +652,7 @@ SlashCmdList["MEPH"] = function(msg)
         DEFAULT_CHAT_FRAME:AddMessage("/meph list - List targets")
         DEFAULT_CHAT_FRAME:AddMessage("/meph wait <seconds> - Set grace period")
         DEFAULT_CHAT_FRAME:AddMessage("/meph emergency <seconds> - Set emergency restore time (5-30s)")
+        DEFAULT_CHAT_FRAME:AddMessage("/meph emergency reset - Reset emergency time to default")
         DEFAULT_CHAT_FRAME:AddMessage("/meph debug - Toggle debug")
         DEFAULT_CHAT_FRAME:AddMessage("/meph test - Test detection")
         DEFAULT_CHAT_FRAME:AddMessage("/meph debuff - Check debuff")
