@@ -1,4 +1,7 @@
 ## Interface: 11200
-## Title: meph
-## Notes: Proof of concept
+## Title: Meph
+## Notes: Disables movement keys when Kara40 Mephistroth casts Shackles.
+## Version: 2.0
+## Author: Livin
+## SavedVariables: MephDB
 meph.lua
