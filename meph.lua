@@ -8,7 +8,7 @@
 
 -- Loading message removed to prevent reload crash
 
--- Saved Variables (persisted between logins) - initialized like TopMeOff
+-- Saved Variables (persisted between logins)
 MephDB = MephDB or {}
 
 -- Simple timer system
@@ -31,7 +31,7 @@ end
 local CAST_TIME = 3.0
 local GRACE_PERIOD = 0.5
 local DEBUG_MODE = false
-local EMERGENCY_RESTORE_TIME = 11.0  -- Emergency restore after 11 seconds
+local EMERGENCY_RESTORE_TIME = 12.0  -- Emergency restore after 12 seconds
 
 -- Movement actions to look for
 local MOVEMENT_ACTIONS = {
@@ -680,3 +680,4 @@ frame:RegisterEvent("CHAT_MSG_MONSTER_EMOTE")
 frame:SetScript("OnEvent", MephEventHandler)
 
 -- Ready message removed to prevent reload crash
+
