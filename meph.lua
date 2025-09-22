@@ -6,27 +6,32 @@
     Added: Emergency restore timer to prevent permanent key lockouts.
 --]]
 
-DEFAULT_CHAT_FRAME:AddMessage("MEPH: Loading movement disabler...")
+-- Loading message removed to prevent reload crash
+
+-- Saved Variables (persisted between logins) - initialized like TopMeOff
+MephDB = MephDB or {}
 
 -- Simple timer system
 local function CreateSimpleTimer(duration, callback)
+    if not duration or not callback then return nil end
     local frame = CreateFrame("Frame")
     local elapsed = 0
     frame:SetScript("OnUpdate", function()
+        if not arg1 then return end
         elapsed = elapsed + arg1
         if elapsed >= duration then
             frame:SetScript("OnUpdate", nil)
-            callback()
+            if callback then callback() end
         end
     end)
     return frame
 end
 
--- Configuration
+-- Configuration (loaded from saved variables)
 local CAST_TIME = 3.0
 local GRACE_PERIOD = 0.5
-local DEBUG_MODE = true
-local EMERGENCY_RESTORE_TIME = 12.0  -- Emergency restore after 12 seconds
+local DEBUG_MODE = false
+local EMERGENCY_RESTORE_TIME = 11.0  -- Emergency restore after 11 seconds
 
 -- Movement actions to look for
 local MOVEMENT_ACTIONS = {
@@ -40,14 +45,8 @@ local MOVEMENT_ACTIONS = {
     "TOGGLEAUTORUN"
 }
 
--- Target configurations
-local targetConfigs = {
-    {
-        caster = "Mephistroth",
-        spell = "Shackles of the Legion", 
-        debuff = "Shackles of the Legion"
-    }
-}
+-- Target configurations (loaded from saved variables)
+local targetConfigs = {}
 
 -- State tracking
 local originalBindings = {}
@@ -58,6 +57,7 @@ local debuffScanFrame = nil
 local stationaryStartTime = nil
 local currentConfig = nil
 local emergencyRestoreTimer = nil  -- New: Emergency restore timer
+local addonLoaded = false  -- Track if addon is fully loaded
 
 -- Debug function
 local function DebugMsg(msg)
@@ -216,7 +216,7 @@ local function HasTargetDebuff(debuffName)
     return false
 end
 
--- Start debuff scanning
+-- Start debuff scanning with continued movement monitoring
 local function StartDebuffScanning()
     if not currentConfig then return end
     
@@ -230,7 +230,7 @@ local function StartDebuffScanning()
     local scanElapsed = 0
     local debuffWasFound = false
     local scanStartTime = GetTime()
-    local NO_DEBUFF_TIMEOUT = 1.5  -- Increased from 1.0 for better reliability
+    local NO_DEBUFF_TIMEOUT = 1.5  -- Time to wait for debuff if none found
     
     debuffScanFrame:SetScript("OnUpdate", function()
         scanElapsed = scanElapsed + arg1
@@ -250,8 +250,9 @@ local function StartDebuffScanning()
                     debuffWasFound = true
                 end
                 
-                -- Continue trying to disable keys during debuff
+                -- CONTINUE trying to disable keys during debuff (extended grace period)
                 if not keysDisabled then
+                    DebugMsg("Debuff active - trying to disable keys...")
                     DisableMovementKeys()
                 end
             else
@@ -266,7 +267,13 @@ local function StartDebuffScanning()
                     castInProgress = false
                     currentConfig = nil
                 else
-                    -- Debuff was never found - check timeout
+                    -- Debuff was never found - CONTINUE trying to disable keys during timeout window
+                    if not keysDisabled and totalScanTime < NO_DEBUFF_TIMEOUT then
+                        DebugMsg("No debuff yet - still trying to disable keys...")
+                        DisableMovementKeys()
+                    end
+                    
+                    -- Check timeout
                     if totalScanTime >= NO_DEBUFF_TIMEOUT then
                         DebugMsg("No debuff found after " .. NO_DEBUFF_TIMEOUT .. "s (resisted?). Restoring keys...")
                         RestoreMovementKeys()
@@ -341,17 +348,86 @@ local function OnChatMessage(event, message)
     end
 end
 
+-- Settings are now saved automatically by WoW when MephDB is modified
+
+-- Load settings from saved variables and initialize defaults
+local function LoadSettings()
+    -- Ensure MephDB exists (SavedVariables might override our initial value)
+    if not MephDB then
+        MephDB = {}
+    end
+    
+    -- Safely initialize targetConfigs with defaults if not present
+    if not MephDB.targetConfigs or type(MephDB.targetConfigs) ~= "table" then
+        MephDB.targetConfigs = {
+            {
+                caster = "Mephistroth",
+                spell = "Shackles of the Legion", 
+                debuff = "Shackles of the Legion"
+            }
+        }
+    end
+    
+    -- Create a safe copy of targetConfigs to avoid reference issues during reload
+    targetConfigs = {}
+    for i, config in ipairs(MephDB.targetConfigs) do
+        if config and config.caster and config.spell and config.debuff then
+            targetConfigs[i] = {
+                caster = config.caster,
+                spell = config.spell,
+                debuff = config.debuff
+            }
+        end
+    end
+    
+    -- Safely initialize settings with defaults if not present
+    if not MephDB.settings or type(MephDB.settings) ~= "table" then
+        MephDB.settings = {
+            CAST_TIME = 3.0,
+            GRACE_PERIOD = 0.5,
+            DEBUG_MODE = false,
+            EMERGENCY_RESTORE_TIME = 11.0
+        }
+    end
+    
+    -- Safely load settings from MephDB
+    CAST_TIME = tonumber(MephDB.settings.CAST_TIME) or 3.0
+    GRACE_PERIOD = tonumber(MephDB.settings.GRACE_PERIOD) or 0.5
+    if MephDB.settings.DEBUG_MODE ~= nil then
+        DEBUG_MODE = MephDB.settings.DEBUG_MODE
+    else
+        DEBUG_MODE = false
+    end
+    EMERGENCY_RESTORE_TIME = tonumber(MephDB.settings.EMERGENCY_RESTORE_TIME) or 11.0
+end
+
 -- Add target configuration
 local function AddTargetConfig(caster, spell, debuff)
+    if not addonLoaded then
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Addon not fully loaded yet. Please wait.")
+        return
+    end
+    
     for i, config in ipairs(targetConfigs) do
         if config.caster == caster and config.spell == spell then
             config.debuff = debuff
+            -- Also update MephDB since we're using copies now
+            if MephDB.targetConfigs[i] then
+                MephDB.targetConfigs[i].debuff = debuff
+            end
             DEFAULT_CHAT_FRAME:AddMessage("MEPH: Updated target: " .. caster .. " -> " .. spell .. " -> " .. debuff)
             return
         end
     end
     
-    table.insert(targetConfigs, {
+    local newConfig = {
+        caster = caster,
+        spell = spell,
+        debuff = debuff
+    }
+    table.insert(targetConfigs, newConfig)
+    -- Also add to MephDB since we're using copies now
+    table.insert(MephDB.targetConfigs, {
         caster = caster,
         spell = spell,
         debuff = debuff
@@ -359,11 +435,34 @@ local function AddTargetConfig(caster, spell, debuff)
     DEFAULT_CHAT_FRAME:AddMessage("MEPH: Added target: " .. caster .. " -> " .. spell .. " -> " .. debuff)
 end
 
+-- Remove target configuration
+local function RemoveTargetConfig(index)
+    if not addonLoaded then
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Addon not fully loaded yet. Please wait.")
+        return
+    end
+    
+    local idx = tonumber(index)
+    if idx and idx > 0 and idx <= table.getn(targetConfigs) then
+        local config = targetConfigs[idx]
+        table.remove(targetConfigs, idx)
+        -- Also remove from MephDB since we're using copies now
+        table.remove(MephDB.targetConfigs, idx)
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Removed target: " .. config.caster .. " -> " .. config.spell .. " -> " .. config.debuff)
+    else
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Invalid target index. Use /meph list to see available targets")
+    end
+end
+
 -- List configurations
 local function ListTargetConfigs()
     DEFAULT_CHAT_FRAME:AddMessage("MEPH: Current target configurations:")
-    for i, config in ipairs(targetConfigs) do
-        DEFAULT_CHAT_FRAME:AddMessage("  " .. i .. ". " .. config.caster .. " -> " .. config.spell .. " -> " .. config.debuff)
+    if table.getn(targetConfigs) == 0 then
+        DEFAULT_CHAT_FRAME:AddMessage("  No targets configured")
+    else
+        for i, config in ipairs(targetConfigs) do
+            DEFAULT_CHAT_FRAME:AddMessage("  " .. i .. ". " .. config.caster .. " -> " .. config.spell .. " -> " .. config.debuff)
+        end
     end
 end
 
@@ -413,30 +512,51 @@ end
 -- Slash commands
 SLASH_MEPH1 = "/meph"
 SlashCmdList["MEPH"] = function(msg)
+    DEFAULT_CHAT_FRAME:AddMessage("MEPH DEBUG: Slash command called with: '" .. msg .. "'")
     local args = ParseQuotedArgs(msg)
     
+    DEFAULT_CHAT_FRAME:AddMessage("MEPH DEBUG: Parsed args: [1]='" .. (args[1] or "nil") .. "' [2]='" .. (args[2] or "nil") .. "' [3]='" .. (args[3] or "nil") .. "' [4]='" .. (args[4] or "nil") .. "'")
+    
     if args[1] == "target" and args[2] and args[3] and args[4] then
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH DEBUG: Calling AddTargetConfig")
         AddTargetConfig(args[2], args[3], args[4])
+    elseif args[1] == "remove" and args[2] then
+        RemoveTargetConfig(args[2])
     elseif args[1] == "list" then
         ListTargetConfigs()
     elseif args[1] == "wait" and args[2] then
+        if not addonLoaded then
+            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Addon not fully loaded yet. Please wait.")
+            return
+        end
         local newWait = tonumber(args[2])
         if newWait and newWait > 0 and newWait <= 3 then
             GRACE_PERIOD = newWait
+            MephDB.settings.GRACE_PERIOD = newWait
             DEFAULT_CHAT_FRAME:AddMessage("MEPH: Grace period set to " .. newWait .. " seconds")
         else
             DEFAULT_CHAT_FRAME:AddMessage("MEPH: Invalid wait time. Use 0.1-3.0 seconds")
         end
     elseif args[1] == "emergency" and args[2] then
+        if not addonLoaded then
+            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Addon not fully loaded yet. Please wait.")
+            return
+        end
         local newTime = tonumber(args[2])
         if newTime and newTime >= 5 and newTime <= 30 then
             EMERGENCY_RESTORE_TIME = newTime
+            MephDB.settings.EMERGENCY_RESTORE_TIME = newTime
             DEFAULT_CHAT_FRAME:AddMessage("MEPH: Emergency restore time set to " .. newTime .. " seconds")
         else
             DEFAULT_CHAT_FRAME:AddMessage("MEPH: Invalid emergency time. Use 5-30 seconds")
         end
     elseif args[1] == "debug" then
+        if not addonLoaded then
+            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Addon not fully loaded yet. Please wait.")
+            return
+        end
         DEBUG_MODE = not DEBUG_MODE
+        MephDB.settings.DEBUG_MODE = DEBUG_MODE
         DEFAULT_CHAT_FRAME:AddMessage("MEPH: Debug mode " .. (DEBUG_MODE and "ON" or "OFF"))
     elseif args[1] == "test" then
         DEFAULT_CHAT_FRAME:AddMessage("MEPH: Testing cast detection...")
@@ -458,9 +578,50 @@ SlashCmdList["MEPH"] = function(msg)
             debuffScanFrame:SetScript("OnUpdate", nil)
         end
         RestoreMovementKeys()
+    elseif args[1] == "cleandups" then
+        if not addonLoaded then
+            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Addon not fully loaded yet. Please wait.")
+            return
+        end
+        -- Remove duplicate entries
+        local seen = {}
+        local cleaned = {}
+        for _, config in ipairs(targetConfigs) do
+            local key = config.caster .. "|" .. config.spell .. "|" .. config.debuff
+            if not seen[key] then
+                seen[key] = true
+                table.insert(cleaned, {
+                    caster = config.caster,
+                    spell = config.spell,
+                    debuff = config.debuff
+                })
+            end
+        end
+        targetConfigs = cleaned
+        -- Create a safe copy for MephDB
+        MephDB.targetConfigs = {}
+        for i, config in ipairs(cleaned) do
+            MephDB.targetConfigs[i] = {
+                caster = config.caster,
+                spell = config.spell,
+                debuff = config.debuff
+            }
+        end
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Cleaned duplicate entries")
+        ListTargetConfigs()
+    elseif args[1] == "status" then
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH STATUS:")
+        DEFAULT_CHAT_FRAME:AddMessage("  addonLoaded: " .. tostring(addonLoaded))
+        DEFAULT_CHAT_FRAME:AddMessage("  MephDB exists: " .. tostring(MephDB ~= nil))
+        if MephDB then
+            DEFAULT_CHAT_FRAME:AddMessage("  MephDB.settings exists: " .. tostring(MephDB.settings ~= nil))
+            DEFAULT_CHAT_FRAME:AddMessage("  MephDB.targetConfigs exists: " .. tostring(MephDB.targetConfigs ~= nil))
+        end
+        DEFAULT_CHAT_FRAME:AddMessage("  targetConfigs count: " .. tostring(table.getn(targetConfigs)))
     else
         DEFAULT_CHAT_FRAME:AddMessage("MEPH Commands:")
         DEFAULT_CHAT_FRAME:AddMessage('/meph target "caster" "spell" "debuff" - Add target')
+        DEFAULT_CHAT_FRAME:AddMessage("/meph remove <index> - Remove target by index")
         DEFAULT_CHAT_FRAME:AddMessage("/meph list - List targets")
         DEFAULT_CHAT_FRAME:AddMessage("/meph wait <seconds> - Set grace period")
         DEFAULT_CHAT_FRAME:AddMessage("/meph emergency <seconds> - Set emergency restore time (5-30s)")
@@ -468,11 +629,42 @@ SlashCmdList["MEPH"] = function(msg)
         DEFAULT_CHAT_FRAME:AddMessage("/meph test - Test detection")
         DEFAULT_CHAT_FRAME:AddMessage("/meph debuff - Check debuff")
         DEFAULT_CHAT_FRAME:AddMessage("/meph reset - Reset all")
+        DEFAULT_CHAT_FRAME:AddMessage("/meph cleandups - Remove duplicate entries")
+        DEFAULT_CHAT_FRAME:AddMessage("/meph status - Show addon status")
+        DEFAULT_CHAT_FRAME:AddMessage("NOTE: All settings are automatically saved!")
     end
 end
 
--- Event frame
-local frame = CreateFrame("Frame")
+-- Event frame with safer handling
+local frame = CreateFrame("Frame", "MephEventFrame")
+
+-- Event handler function
+local function MephEventHandler()
+    if not event or not arg1 then return end
+    
+    if event == "ADDON_LOADED" and arg1 == "meph" then
+        -- Protect against multiple loads
+        if addonLoaded then return end
+        
+        LoadSettings()  -- Load saved settings
+        addonLoaded = true  -- Mark addon as fully loaded
+        
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Loaded successfully!")
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Type /meph for commands")
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Emergency restore after " .. EMERGENCY_RESTORE_TIME .. " seconds")
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Debug mode " .. (DEBUG_MODE and "ON" or "OFF"))
+        StoreOriginalBindings()
+        ListTargetConfigs()
+    else
+        -- Only handle chat messages if addon is loaded
+        if addonLoaded then
+            OnChatMessage(event, arg1)
+        end
+    end
+end
+
+-- Register events
+frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("CHAT_MSG_SPELL_CREATURE_VS_CREATURE_DAMAGE")
 frame:RegisterEvent("CHAT_MSG_SPELL_HOSTILEPLAYER_DAMAGE") 
 frame:RegisterEvent("CHAT_MSG_SPELL_FRIENDLYPLAYER_DAMAGE")
@@ -484,21 +676,7 @@ frame:RegisterEvent("CHAT_MSG_COMBAT_FRIENDLYPLAYER_VS_PLAYER")
 frame:RegisterEvent("CHAT_MSG_COMBAT_PARTY_VS_CREATURE")
 frame:RegisterEvent("CHAT_MSG_RAID_BOSS_EMOTE")
 frame:RegisterEvent("CHAT_MSG_MONSTER_EMOTE")
-frame:RegisterEvent("PLAYER_LOGIN")
 
-frame:SetScript("OnEvent", function()
-    local event = event
-    local arg1 = arg1
-    
-    if event == "PLAYER_LOGIN" then
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Loaded successfully!")
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Type /meph for commands")
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Emergency restore after " .. EMERGENCY_RESTORE_TIME .. " seconds")
-        StoreOriginalBindings()
-        ListTargetConfigs()
-    else
-        OnChatMessage(event, arg1)
-    end
-end)
+frame:SetScript("OnEvent", MephEventHandler)
 
-DEFAULT_CHAT_FRAME:AddMessage("MEPH: Ready!")
+-- Ready message removed to prevent reload crash
