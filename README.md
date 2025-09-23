@@ -50,7 +50,7 @@ All settings are automatically saved between sessions.
 
 ## Notes
 
-- Works with movement keys bindings ("MOVEFORWARD", "MOVEBACKWARD", "STRAFELEFT", "STRAFERIGHT", "TURNLEFT", "TURNRIGHT", "JUMP", "TOGGLEAUTORUN"
+- Works with movement keys bindings ("MOVEFORWARD", "MOVEBACKWARD", "STRAFELEFT", "STRAFERIGHT", "TURNLEFT", "TURNRIGHT", "JUMP", "TOGGLEAUTORUN")
 - Compatible with Turtle WoW and vanilla clients based on Engine 1.12
 - Safe emergency restore prevents permanent key lockouts
 - Only removes keybindings if no input for long enough - previous addons removed Keybindings while keys were pressed, which caused the key input to be stuck (W continued forward walking)
