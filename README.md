@@ -37,7 +37,7 @@ Type `/meph` in chat to see all available commands:
 
 Example:
 ```
-/meph target "Mephistroth" "Shackles of the Legion" "Shackles of the Legion"
+/meph target "Mephistroth" "Shackles of the Legion" "Shackles of the Legion" (already added by default)
 /meph target PlayerMage Frostbolt Frostbolt
 ```
 
