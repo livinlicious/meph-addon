@@ -16,9 +16,9 @@ addons/meph/
 
 - **Automatic**: Works immediately when addon is loaded
 - **Default Target**: Mephistroth casting "Shackles of the Legion"
-- **Smart Detection**: Waits for you to stop moving (default: 0.5sec), then disables movement keys (congigurable via /meph wait <insert number of seconds> - example: /meph wait 0.3/0.5/1.0)
+- **Smart Detection**: Waits for you to stop moving (default: 0.5sec), then disables movement keys (config with /meph wait <insert number of seconds>)
 - **Auto Restore**: Keys are restored when the debuff wears off
-- **Emergency Restore**: Keys automatically restored after 12 seconds (configurable via /meph emergency <insert number of seconds> - example /meph emergency 12/15/20)
+- **Emergency Restore**: Keys automatically restored after 12 seconds (config with /meph emergency <insert number of seconds>)
 
 ## Testing & Configuration
 
