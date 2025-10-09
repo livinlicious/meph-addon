@@ -20,6 +20,13 @@ addons/meph/
 - **Auto Restore**: Keys are restored when the debuff wears off or is not on you at all
 - **Emergency Restore**: Keys automatically restored after 12 seconds (config with /meph emergency <insert number of seconds>)
 
+## Without Shackles
+![Demo](no_shackles.png)
+
+## During Shackles
+![Demo](during_shackles.png)
+
+
 ## Testing & Configuration
 
 Type `/meph` in chat to see all available commands:
