@@ -1,222 +1,297 @@
 --[[
-    MEPH IMPROVED: Simple Movement Disabler with Emergency Restore
-    
-    Simple system to disable movement keys when specific units cast specific spells.
-    Waits for player to be stationary, then disables keys until debuff is gone.
-    Added: Emergency restore timer to prevent permanent key lockouts.
+    MEPH: Movement Blocker with Key Unbinding
+
+    When a configured boss casts a spell:
+    1. Block ALL keyboard input immediately
+    2. Unbind movement keys (safe - keys released during block)
+    3. Unblock keyboard (keys stay unbound)
+    4. Wait for debuff to expire
+    5. Rebind movement keys
 --]]
 
--- Loading message removed to prevent reload crash
-
--- Saved Variables (persisted between logins)
+-- Initialize saved variables on load
 MephDB = MephDB or {}
 
--- Simple timer system
-local function CreateSimpleTimer(duration, callback)
-    if not duration or not callback then return nil end
-    local frame = CreateFrame("Frame")
-    local elapsed = 0
-    frame:SetScript("OnUpdate", function()
-        if not arg1 then return end
-        elapsed = elapsed + arg1
-        if elapsed >= duration then
-            frame:SetScript("OnUpdate", nil)
-            if callback then callback() end
+-- Set defaults if not present
+local function InitializeDB()
+    if not MephDB.targets then
+        MephDB.targets = {
+            {caster = "Mephistroth", spell = "Shackles of the Legion", debuff = "Shackles of the Legion"}
+        }
+    end
+    if not MephDB.emergency_time then
+        MephDB.emergency_time = 12.0
+    end
+    if MephDB.debug == nil then
+        MephDB.debug = false
+    end
+end
+
+-- State
+local blockFrame = nil
+local isBlocking = false
+local debuffScanFrame = nil
+local activeConfig = nil
+local emergencyTimer = nil
+local keysUnbound = false
+local savedBindings = {}
+local playerPos = {lastX = 0, lastY = 0, lastTime = 0}
+local unbindFrame = nil  -- Global reference to movement check frame
+
+-- Debug window
+local debugWindow = nil
+local debugEditBox = nil
+local debugText = ""
+
+-- Create debug window
+local function CreateDebugWindow()
+    if debugWindow then return end
+
+    -- Main frame
+    debugWindow = CreateFrame("Frame", "MephDebugWindow", UIParent)
+    debugWindow:SetWidth(600)
+    debugWindow:SetHeight(500)
+    debugWindow:SetPoint("CENTER", 0, 0)
+    debugWindow:SetBackdrop({
+        bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+        tile = true, tileSize = 32, edgeSize = 32,
+        insets = {left = 11, right = 12, top = 12, bottom = 11}
+    })
+    debugWindow:SetMovable(true)
+    debugWindow:EnableMouse(true)
+    debugWindow:RegisterForDrag("LeftButton")
+    debugWindow:SetScript("OnDragStart", function() this:StartMoving() end)
+    debugWindow:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+    debugWindow:Hide()
+
+    -- Title
+    local title = debugWindow:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOP", 0, -15)
+    title:SetText("MEPH Debug Log")
+
+    -- Close button (also disables debug mode)
+    local closeButton = CreateFrame("Button", nil, debugWindow, "UIPanelCloseButton")
+    closeButton:SetPoint("TOPRIGHT", -5, -5)
+    closeButton:SetScript("OnClick", function()
+        debugWindow:Hide()
+        MephDB.debug = false
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Debug mode OFF")
+    end)
+
+    -- Select All button
+    local selectButton = CreateFrame("Button", nil, debugWindow, "UIPanelButtonTemplate")
+    selectButton:SetWidth(80)
+    selectButton:SetHeight(22)
+    selectButton:SetPoint("BOTTOMLEFT", 20, 15)
+    selectButton:SetText("Select All")
+    selectButton:SetScript("OnClick", function()
+        if debugEditBox then
+            debugEditBox:HighlightText()
+            debugEditBox:SetFocus()
         end
     end)
-    return frame
+
+    -- Clear button
+    local clearButton = CreateFrame("Button", nil, debugWindow, "UIPanelButtonTemplate")
+    clearButton:SetWidth(60)
+    clearButton:SetHeight(22)
+    clearButton:SetPoint("LEFT", selectButton, "RIGHT", 5, 0)
+    clearButton:SetText("Clear")
+    clearButton:SetScript("OnClick", function()
+        debugText = ""
+        if debugEditBox then
+            debugEditBox:SetText("")
+        end
+    end)
+
+    -- Scroll frame
+    local scrollFrame = CreateFrame("ScrollFrame", "MephDebugScroll", debugWindow, "UIPanelScrollFrameTemplate")
+    scrollFrame:SetPoint("TOPLEFT", 20, -40)
+    scrollFrame:SetPoint("BOTTOMRIGHT", -30, 50)
+
+    -- Edit box (properly sized for scrolling)
+    debugEditBox = CreateFrame("EditBox", nil, scrollFrame)
+    debugEditBox:SetMultiLine(true)
+    debugEditBox:SetFontObject(ChatFontNormal)
+    debugEditBox:SetWidth(scrollFrame:GetWidth())
+    debugEditBox:SetHeight(5000)  -- Large fixed height for scrolling
+    debugEditBox:SetMaxLetters(0)  -- No character limit
+    debugEditBox:SetAutoFocus(false)
+    debugEditBox:EnableMouse(true)
+    debugEditBox:SetScript("OnEscapePressed", function() this:ClearFocus() end)
+
+    scrollFrame:SetScrollChild(debugEditBox)
 end
 
--- Configuration (loaded from saved variables)
-local CAST_TIME = 3.0
-local GRACE_PERIOD = 0.5
-local DEBUG_MODE = false
-local EMERGENCY_RESTORE_TIME = 12.0  -- Emergency restore keys after this time no matter what
+-- Debug output (always captures, always outputs to debug window)
+local function Debug(msg)
+    local timestamp = date("%H:%M:%S")
+    local logMsg = "[" .. timestamp .. "] " .. msg
 
--- Movement actions to look for
-local MOVEMENT_ACTIONS = {
-    "MOVEFORWARD",
-    "MOVEBACKWARD", 
-    "STRAFELEFT",
-    "STRAFERIGHT",
-    "TURNLEFT",
-    "TURNRIGHT",
-    "JUMP",
-    "TOGGLEAUTORUN"
-}
+    -- ALWAYS add to debugText buffer (even if window closed)
+    debugText = debugText .. logMsg .. "\n"
 
--- Target configurations (loaded from saved variables)
-local targetConfigs = {}
+    -- Update window if it exists
+    if debugEditBox then
+        debugEditBox:SetText(debugText)
 
--- State tracking
-local originalBindings = {}
-local playerPos = {}
-local castInProgress = false
-local keysDisabled = false
-local debuffScanFrame = nil
-local stationaryStartTime = nil
-local currentConfig = nil
-local emergencyRestoreTimer = nil  -- New: Emergency restore timer
-local addonLoaded = false  -- Track if addon is fully loaded
-
--- Debug function
-local function DebugMsg(msg)
-    if DEBUG_MODE then
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH DEBUG: " .. msg)
-    end
-end
-
--- Movement detection
-local function IsPlayerMoving()
-    local x, y = GetPlayerMapPosition("player")
-    local now = GetTime()
-    
-    if not playerPos.lastX then
-        playerPos.lastX, playerPos.lastY = x, y
-        playerPos.lastTime = now
-        return false
-    end
-    
-    if now - (playerPos.lastTime or 0) < 0.1 then
-        return playerPos.wasMoving or false
-    end
-    
-    local moved = (x ~= playerPos.lastX or y ~= playerPos.lastY)
-    playerPos.lastX, playerPos.lastY = x, y
-    playerPos.lastTime = now
-    playerPos.wasMoving = moved
-    
-    -- Track stationary time
-    if moved then
-        stationaryStartTime = nil
-    else
-        if not stationaryStartTime then
-            stationaryStartTime = now
+        -- Scroll to bottom
+        local scrollFrame = debugEditBox:GetParent()
+        if scrollFrame then
+            scrollFrame:UpdateScrollChildRect()
+            local maxScroll = scrollFrame:GetVerticalScrollRange()
+            if maxScroll and maxScroll > 0 then
+                scrollFrame:SetVerticalScroll(maxScroll)
+            end
         end
     end
-    
+end
+
+-- Create the blocking frame
+local function CreateBlockFrame()
+    if blockFrame then return end
+
+    blockFrame = CreateFrame("Frame", "MephBlockFrame")
+    blockFrame:SetFrameStrata("TOOLTIP")
+    blockFrame:EnableKeyboard(false)
+end
+
+-- Start blocking ALL keyboard input
+local function BlockKeys()
+    if isBlocking then return end
+
+    if not blockFrame then CreateBlockFrame() end
+
+    blockFrame:EnableKeyboard(true)
+    blockFrame:SetScript("OnKeyDown", function() end)  -- Eat all key presses
+    blockFrame:SetScript("OnKeyUp", function() end)    -- Eat all key releases
+
+    isBlocking = true
+    Debug("KEYS BLOCKED!")
+end
+
+-- Stop blocking keyboard
+local function StopBlocking()
+    if not isBlocking then return end
+
+    if blockFrame then
+        blockFrame:EnableKeyboard(false)
+        blockFrame:SetScript("OnKeyDown", nil)
+        blockFrame:SetScript("OnKeyUp", nil)
+    end
+
+    isBlocking = false
+    Debug("Keyboard blocking disabled")
+end
+
+-- Check if player is moving by comparing coordinates
+local function IsPlayerMoving()
+    local x, y = GetPlayerMapPosition("player")
+
+    -- If coordinates are 0,0 (player not on world map), consider as not moving
+    if x == 0 and y == 0 then
+        return false
+    end
+
+    local moved = (x ~= playerPos.lastX or y ~= playerPos.lastY)
+    playerPos.lastX = x
+    playerPos.lastY = y
+
     return moved
 end
 
--- Store original bindings by scanning all bindings for movement actions
+-- Store original bindings (EXACT COPY FROM WORKING VERSION)
 local function StoreOriginalBindings()
-    originalBindings = {}
-    
-    -- Scan through all possible bindings to find movement keys
+    savedBindings = {}
+
+    -- Don't unbind TOGGLEAUTORUN so player can stop auto-run!
+    -- Don't unbind turn since turning doesn't break shackles
+    local actions = {"MOVEFORWARD", "MOVEBACKWARD", "STRAFELEFT", "STRAFERIGHT", "JUMP"}
+
     for i = 1, GetNumBindings() do
         local command, key1, key2 = GetBinding(i)
-        
-        -- Check if this command is a movement action we want to disable
-        for _, movementAction in ipairs(MOVEMENT_ACTIONS) do
+
+        for _, movementAction in ipairs(actions) do
             if command == movementAction then
                 if key1 then
-                    originalBindings[key1] = command
-                    DebugMsg("Found movement key: " .. key1 .. " -> " .. command)
+                    savedBindings[key1] = command
+                    Debug("Saved binding: " .. key1 .. " = " .. command)
                 end
                 if key2 then
-                    originalBindings[key2] = command
-                    DebugMsg("Found movement key: " .. key2 .. " -> " .. command)
+                    savedBindings[key2] = command
+                    Debug("Saved binding: " .. key2 .. " = " .. command)
                 end
                 break
             end
         end
     end
-    
-    DebugMsg("Stored " .. table.getn(originalBindings) .. " movement key bindings")
+    -- Count hash table entries manually
+    local count = 0
+    for _ in pairs(savedBindings) do count = count + 1 end
+    Debug("Total keys saved: " .. count)
 end
 
--- Restore movement keys function
-local function RestoreMovementKeys()
-    if not keysDisabled then return end
-    
-    for key, action in pairs(originalBindings) do
-        SetBinding(key, action)
+-- Unbind movement keys
+local function UnbindKeys()
+    if keysUnbound then
+        Debug("UnbindKeys called but already unbound")
+        return
+    end
+
+    Debug("Unbinding keys...")
+    for key, action in pairs(savedBindings) do
+        SetBinding(key)  -- Unbind
+        Debug("  Unbound: " .. key .. " (was " .. action .. ")")
     end
     SaveBindings(2)
-    
-    keysDisabled = false
-    originalBindings = {}
-    
-    -- Cancel emergency restore timer if it exists
-    if emergencyRestoreTimer then
-        emergencyRestoreTimer:SetScript("OnUpdate", nil)
-        emergencyRestoreTimer = nil
+
+    keysUnbound = true
+    Debug("All keys unbound")
+    DEFAULT_CHAT_FRAME:AddMessage("MEPH: Movement keys DISABLED!")
+end
+
+-- Rebind movement keys (EXACT COPY FROM WORKING VERSION)
+local function RebindKeys()
+    Debug("RebindKeys called")
+    StopBlocking()  -- Always stop blocking first
+
+    -- Stop movement check frame if it's still running
+    if unbindFrame then
+        unbindFrame:SetScript("OnUpdate", nil)
+        unbindFrame = nil
+        Debug("Stopped movement check frame from RebindKeys")
     end
-    
+
+    Debug("Rebinding keys...")
+    for key, action in pairs(savedBindings) do
+        SetBinding(key, action)
+        Debug("  Rebound: " .. key .. " = " .. action)
+    end
+    SaveBindings(2)
+
+    keysUnbound = false
+    savedBindings = {}
+
+    Debug("Movement keys RESTORED! YOU CAN MOVE!")
     DEFAULT_CHAT_FRAME:AddMessage("MEPH: Movement keys RESTORED! YOU CAN MOVE!")
 end
 
--- Disable movement keys
-local function DisableMovementKeys()
-    if keysDisabled then return end
-    
-    local isMoving = IsPlayerMoving()
-    local now = GetTime()
-    
-    if isMoving then
-        DebugMsg("Player still moving, waiting...")
-        return false
-    end
-    
-    if not stationaryStartTime then
-        DebugMsg("Player just stopped, starting grace period...")
-        return false
-    end
-    
-    local stationaryDuration = now - stationaryStartTime
-    if stationaryDuration < GRACE_PERIOD then
-        DebugMsg("Grace period active (" .. string.format("%.1f", stationaryDuration) .. "s/" .. GRACE_PERIOD .. "s)")
-        return false
-    end
-    
-    if not next(originalBindings) then
-        StoreOriginalBindings()
-    end
-    
-    -- Disable each discovered movement key
-    for key, action in pairs(originalBindings) do
-        SetBinding(key)  -- Unbind the key
-        DebugMsg("Disabled key: " .. key .. " (was " .. action .. ")")
-    end
-    SaveBindings(2)
-    
-    keysDisabled = true
-    DEFAULT_CHAT_FRAME:AddMessage("MEPH: Movement keys DISABLED!")
-    
-    -- NEW: Start emergency restore timer
-    local emergencyTime = EMERGENCY_RESTORE_TIME  -- Capture current value
-    emergencyRestoreTimer = CreateSimpleTimer(emergencyTime, function()
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: EMERGENCY RESTORE! Keys disabled for " .. emergencyTime .. " seconds!")
-        -- Emergency restore should stop all scanning and force restore
-        if debuffScanFrame then
-            debuffScanFrame:SetScript("OnUpdate", nil)
-        end
-        castInProgress = false
-        currentConfig = nil
-        RestoreMovementKeys()
-    end)
-    
-    return true
-end
-
-
--- Debuff detection
-local tooltip = CreateFrame("GameTooltip", "MephTooltip", nil, "GameTooltipTemplate")
+-- Check if player has a specific debuff
+local tooltip = CreateFrame("GameTooltip", "MephScanTooltip", nil, "GameTooltipTemplate")
 tooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
 
-local function GetDebuffName(debuffIndex)
+local function GetDebuffName(index)
     tooltip:ClearLines()
-    tooltip:SetUnitDebuff("player", debuffIndex)
-    local name = MephTooltipTextLeft1:GetText()
-    return name
+    tooltip:SetUnitDebuff("player", index)
+    return MephScanTooltipTextLeft1:GetText()
 end
 
-local function HasTargetDebuff(debuffName)
+local function HasDebuff(name)
     for i = 1, 16 do
-        local debuffTexture = UnitDebuff("player", i)
-        if debuffTexture then
-            local foundDebuffName = GetDebuffName(i)
-            if foundDebuffName and string.lower(foundDebuffName) == string.lower(debuffName) then
+        if UnitDebuff("player", i) then
+            local debuffName = GetDebuffName(i)
+            if debuffName and string.lower(debuffName) == string.lower(name) then
                 return true
             end
         end
@@ -224,256 +299,192 @@ local function HasTargetDebuff(debuffName)
     return false
 end
 
--- Start debuff scanning with continued movement monitoring
-local function StartDebuffScanning()
-    if not currentConfig then return end
-    
+-- Scan for debuff and rebind when gone
+local function StartDebuffScan(debuffName)
     if debuffScanFrame then
         debuffScanFrame:SetScript("OnUpdate", nil)
     end
-    
-    DebugMsg("Starting scan for debuff: " .. currentConfig.debuff)
-    
+
+    Debug("Starting debuff scan for: " .. debuffName)
+
+    local scanTimer = 0
+    local debuffFound = false
+    local startTime = GetTime()
+    local scanCount = 0
+
     debuffScanFrame = CreateFrame("Frame")
-    local scanElapsed = 0
-    local debuffWasFound = false
-    local scanStartTime = GetTime()
-    local NO_DEBUFF_TIMEOUT = 1.5  -- Time to wait for debuff if none found
-    
     debuffScanFrame:SetScript("OnUpdate", function()
-        scanElapsed = scanElapsed + arg1
-        
-        -- Only scan every 0.1 seconds for more responsive detection
-        if scanElapsed >= 0.1 then
-            scanElapsed = 0
-            
-            local hasDebuff = HasTargetDebuff(currentConfig.debuff)
-            local totalScanTime = GetTime() - scanStartTime
-            
-            DebugMsg("Debuff scan: " .. (hasDebuff and "FOUND" or "NOT FOUND") .. " (" .. string.format("%.1f", totalScanTime) .. "s)")
-            
-            if hasDebuff then
-                if not debuffWasFound then
-                    DebugMsg(currentConfig.debuff .. " debuff detected!")
-                    debuffWasFound = true
+        scanTimer = scanTimer + arg1
+
+        if scanTimer >= 0.1 then
+            scanTimer = 0
+            scanCount = scanCount + 1
+
+            local hasIt = HasDebuff(debuffName)
+            local elapsed = GetTime() - startTime
+
+            if hasIt then
+                if not debuffFound then
+                    Debug("Debuff FOUND! (scan #" .. scanCount .. ", elapsed: " .. string.format("%.1f", elapsed) .. "s)")
                 end
-                
-                -- CONTINUE trying to disable keys during debuff (extended grace period)
-                if not keysDisabled then
-                    DebugMsg("Debuff active - trying to disable keys...")
-                    DisableMovementKeys()
-                end
+                debuffFound = true
             else
-                -- Debuff not found
-                if debuffWasFound then
-                    -- Debuff was there but now gone
-                    DebugMsg(currentConfig.debuff .. " debuff GONE! Restoring keys...")
-                    RestoreMovementKeys()
-                    
-                    -- Stop scanning
+                if debuffFound then
+                    -- Debuff was there, now it's gone - REBIND KEYS
+                    Debug("Debuff EXPIRED (scan #" .. scanCount .. ", elapsed: " .. string.format("%.1f", elapsed) .. "s)")
+                    RebindKeys()
+
+                    -- Clean up
                     debuffScanFrame:SetScript("OnUpdate", nil)
-                    castInProgress = false
-                    currentConfig = nil
-                else
-                    -- Debuff was never found - CONTINUE trying to disable keys during timeout window
-                    if not keysDisabled and totalScanTime < NO_DEBUFF_TIMEOUT then
-                        DebugMsg("No debuff yet - still trying to disable keys...")
-                        DisableMovementKeys()
+                    activeConfig = nil
+                    if emergencyTimer then
+                        emergencyTimer:SetScript("OnUpdate", nil)
+                        emergencyTimer = nil
                     end
-                    
-                    -- Check timeout
-                    if totalScanTime >= NO_DEBUFF_TIMEOUT then
-                        DebugMsg("No debuff found after " .. NO_DEBUFF_TIMEOUT .. "s (resisted?). Restoring keys...")
-                        RestoreMovementKeys()
-                        
-                        -- Stop scanning
+                    Debug("Debuff scan cleanup complete")
+                else
+                    -- Never found debuff - timeout after 2 seconds
+                    if elapsed >= 2.0 then
+                        Debug("Debuff NEVER FOUND - timeout after " .. string.format("%.1f", elapsed) .. "s (resisted?)")
+                        RebindKeys()
                         debuffScanFrame:SetScript("OnUpdate", nil)
-                        castInProgress = false
-                        currentConfig = nil
+                        activeConfig = nil
+                        if emergencyTimer then
+                            emergencyTimer:SetScript("OnUpdate", nil)
+                            emergencyTimer = nil
+                        end
+                        Debug("Timeout cleanup complete")
                     end
                 end
             end
+        end
+    end)
+end
+
+-- Emergency restore timer
+local function StartEmergencyTimer()
+    if emergencyTimer then
+        emergencyTimer:SetScript("OnUpdate", nil)
+    end
+
+    Debug("Emergency timer started (" .. MephDB.emergency_time .. "s)")
+
+    local elapsed = 0
+    emergencyTimer = CreateFrame("Frame")
+    emergencyTimer:SetScript("OnUpdate", function()
+        elapsed = elapsed + arg1
+        if elapsed >= MephDB.emergency_time then
+            Debug("EMERGENCY RESTORE TRIGGERED! (" .. string.format("%.1f", elapsed) .. "s)")
+            StopBlocking()
+            RebindKeys()
+            if debuffScanFrame then
+                debuffScanFrame:SetScript("OnUpdate", nil)
+            end
+            activeConfig = nil
+            emergencyTimer:SetScript("OnUpdate", nil)
+            Debug("Emergency restore complete")
         end
     end)
 end
 
 -- Handle cast detection
-local function OnTargetCastDetected(config)
-    if castInProgress then return end
-    
-    castInProgress = true
-    currentConfig = config
+local function OnCastDetected(config)
+    if activeConfig then return end  -- Already active
+
+    activeConfig = config
+    Debug(config.caster .. " casting " .. config.spell .. "!")
     DEFAULT_CHAT_FRAME:AddMessage("MEPH: " .. config.caster .. " casting " .. config.spell .. "! STOP MOVING NOW!!!")
-    
-    -- Monitor during cast
-    local castStartTime = GetTime()
-    local castFrame = CreateFrame("Frame")
-    local castElapsed = 0
-    
-    castFrame:SetScript("OnUpdate", function()
-        castElapsed = castElapsed + arg1
-        
-        -- Check every 0.1 seconds during cast
-        if castElapsed >= 0.1 then
-            castElapsed = 0
-            
-            local elapsed = GetTime() - castStartTime
-            
-            if elapsed >= CAST_TIME then
-                -- Cast finished, start debuff scanning
-                DebugMsg("Cast finished, starting debuff scan...")
-                StartDebuffScanning()
-                
-                -- Try to disable keys one more time
-                if not keysDisabled then
-                    DisableMovementKeys()
+
+    -- STEP 1: BLOCK keyboard immediately
+    BlockKeys()
+
+    -- STEP 2: Save current bindings
+    StoreOriginalBindings()
+
+    -- STEP 3: Initialize position tracking
+    local x, y = GetPlayerMapPosition("player")
+    playerPos.lastX = x
+    playerPos.lastY = y
+    Debug("Initial position: " .. x .. ", " .. y)
+
+    -- STEP 4: Monitor for safe moment to unbind (no time limit, wait as long as needed)
+    -- Stop previous movement check frame if it exists
+    if unbindFrame then
+        unbindFrame:SetScript("OnUpdate", nil)
+        Debug("Stopped previous movement check frame")
+    end
+
+    local checkTimer = 0
+    local stationaryTime = 0
+    local totalElapsed = 0
+    local checkCount = 0
+    unbindFrame = CreateFrame("Frame")
+    unbindFrame:SetScript("OnUpdate", function()
+        checkTimer = checkTimer + arg1
+        totalElapsed = totalElapsed + arg1
+
+        -- Check movement every 0.1 seconds
+        if checkTimer >= 0.1 then
+            checkTimer = 0
+            checkCount = checkCount + 1
+
+            local isMoving = IsPlayerMoving()
+
+            if isMoving then
+                -- Player is moving, reset stationary timer
+                if stationaryTime > 0 then
+                    Debug("Player moved after being stationary for " .. string.format("%.1f", stationaryTime) .. "s")
                 end
-                
-                castFrame:SetScript("OnUpdate", nil)
-                return
-            end
-            
-            -- During cast: try to disable keys when player stops moving
-            if not keysDisabled then
-                DisableMovementKeys()
+                stationaryTime = 0
+            else
+                -- Player is stationary, accumulate time
+                stationaryTime = stationaryTime + 0.1
+                Debug("Stationary: " .. string.format("%.1f", stationaryTime) .. "s (check #" .. checkCount .. ", elapsed: " .. string.format("%.1f", totalElapsed) .. "s)")
+
+                -- If player has been stationary for 0.7 seconds AND we're still in active sequence, safe to unbind
+                if stationaryTime >= 0.7 and not keysUnbound and activeConfig then
+                    Debug("Stationary threshold reached! Unbinding now...")
+                    UnbindKeys()
+
+                    -- Wait another 0.5 seconds, THEN stop blocking
+                    Debug("Waiting 0.5s before unblocking...")
+                    local postTimer = 0
+                    local postFrame = CreateFrame("Frame")
+                    postFrame:SetScript("OnUpdate", function()
+                        postTimer = postTimer + arg1
+                        if postTimer >= 0.5 then
+                            StopBlocking()
+                            postFrame:SetScript("OnUpdate", nil)
+                            Debug("Unblocking complete")
+                        end
+                    end)
+
+                    unbindFrame:SetScript("OnUpdate", nil)
+                    unbindFrame = nil
+                    Debug("Movement check frame stopped")
+                end
             end
         end
     end)
+
+    -- Start scanning for debuff (will rebind when debuff expires)
+    StartDebuffScan(config.debuff)
+
+    -- Start emergency timer
+    StartEmergencyTimer()
 end
 
--- Chat message handler
-local function OnChatMessage(event, message)
+-- Chat event handler
+local function OnChatEvent(event, message)
     if not message then return end
-    
-    for _, config in ipairs(targetConfigs) do
+
+    for _, config in ipairs(MephDB.targets) do
         if string.find(message, config.caster) and string.find(message, config.spell) then
             if string.find(message, "begins to cast") or string.find(message, "casts") then
-                DebugMsg("CAST DETECTED: " .. message)
-                OnTargetCastDetected(config)
+                Debug("Cast detected: " .. message)
+                OnCastDetected(config)
                 break
             end
-        end
-    end
-end
-
-
--- Load settings from saved variables and initialize defaults
-local function LoadSettings()
-    -- Ensure MephDB exists (SavedVariables might override our initial value)
-    if not MephDB then
-        MephDB = {}
-    end
-    
-    -- Safely initialize targetConfigs with defaults if not present
-    if not MephDB.targetConfigs or type(MephDB.targetConfigs) ~= "table" then
-        MephDB.targetConfigs = {
-            {
-                caster = "Mephistroth",
-                spell = "Shackles of the Legion", 
-                debuff = "Shackles of the Legion"
-            }
-        }
-    end
-    
-    -- Create a safe copy of targetConfigs to avoid reference issues during reload
-    targetConfigs = {}
-    for i, config in ipairs(MephDB.targetConfigs) do
-        if config and config.caster and config.spell and config.debuff then
-            targetConfigs[i] = {
-                caster = config.caster,
-                spell = config.spell,
-                debuff = config.debuff
-            }
-        end
-    end
-    
-    -- Safely initialize settings with defaults if not present
-    if not MephDB.settings or type(MephDB.settings) ~= "table" then
-        MephDB.settings = {
-            CAST_TIME = 3.0,
-            GRACE_PERIOD = 0.5,
-            DEBUG_MODE = false
-            -- EMERGENCY_RESTORE_TIME only added when user changes it
-        }
-    end
-    
-    -- Safely load settings from MephDB
-    CAST_TIME = tonumber(MephDB.settings.CAST_TIME) or 3.0
-    GRACE_PERIOD = tonumber(MephDB.settings.GRACE_PERIOD) or 0.5
-    if MephDB.settings.DEBUG_MODE ~= nil then
-        DEBUG_MODE = MephDB.settings.DEBUG_MODE
-    else
-        DEBUG_MODE = false
-    end
-    -- Use saved override or keep the hardcoded default
-    if MephDB.settings.EMERGENCY_RESTORE_TIME then
-        EMERGENCY_RESTORE_TIME = tonumber(MephDB.settings.EMERGENCY_RESTORE_TIME)
-    end
-    -- If no override in DB, EMERGENCY_RESTORE_TIME keeps its hardcoded default value
-end
-
-
--- Add target configuration
-local function AddTargetConfig(caster, spell, debuff)
-    if not addonLoaded then
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Addon not fully loaded yet. Please wait.")
-        return
-    end
-    
-    for i, config in ipairs(targetConfigs) do
-        if config.caster == caster and config.spell == spell then
-            config.debuff = debuff
-            -- Also update MephDB since we're using copies now
-            if MephDB.targetConfigs[i] then
-                MephDB.targetConfigs[i].debuff = debuff
-            end
-            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Updated target: " .. caster .. " -> " .. spell .. " -> " .. debuff)
-            return
-        end
-    end
-    
-    local newConfig = {
-        caster = caster,
-        spell = spell,
-        debuff = debuff
-    }
-    table.insert(targetConfigs, newConfig)
-    -- Also add to MephDB since we're using copies now
-    table.insert(MephDB.targetConfigs, {
-        caster = caster,
-        spell = spell,
-        debuff = debuff
-    })
-    DEFAULT_CHAT_FRAME:AddMessage("MEPH: Added target: " .. caster .. " -> " .. spell .. " -> " .. debuff)
-end
-
--- Remove target configuration
-local function RemoveTargetConfig(index)
-    if not addonLoaded then
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Addon not fully loaded yet. Please wait.")
-        return
-    end
-    
-    local idx = tonumber(index)
-    if idx and idx > 0 and idx <= table.getn(targetConfigs) then
-        local config = targetConfigs[idx]
-        table.remove(targetConfigs, idx)
-        -- Also remove from MephDB since we're using copies now
-        table.remove(MephDB.targetConfigs, idx)
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Removed target: " .. config.caster .. " -> " .. config.spell .. " -> " .. config.debuff)
-    else
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Invalid target index. Use /meph list to see available targets")
-    end
-end
-
--- List configurations
-local function ListTargetConfigs()
-    DEFAULT_CHAT_FRAME:AddMessage("MEPH: Current target configurations:")
-    if table.getn(targetConfigs) == 0 then
-        DEFAULT_CHAT_FRAME:AddMessage("  No targets configured")
-    else
-        for i, config in ipairs(targetConfigs) do
-            DEFAULT_CHAT_FRAME:AddMessage("  " .. i .. ". " .. config.caster .. " -> " .. config.spell .. " -> " .. config.debuff)
         end
     end
 end
@@ -484,10 +495,10 @@ local function ParseQuotedArgs(msg)
     local current = ""
     local inQuotes = false
     local i = 1
-    
+
     while i <= string.len(msg) do
         local char = string.sub(msg, i, i)
-        
+
         if char == '"' then
             if inQuotes then
                 if current ~= "" then
@@ -510,190 +521,145 @@ local function ParseQuotedArgs(msg)
         else
             current = current .. char
         end
-        
+
         i = i + 1
     end
-    
+
     if current ~= "" then
         table.insert(args, current)
     end
-    
+
     return args
 end
 
 -- Slash commands
 SLASH_MEPH1 = "/meph"
 SlashCmdList["MEPH"] = function(msg)
-    DEFAULT_CHAT_FRAME:AddMessage("MEPH DEBUG: Slash command called with: '" .. msg .. "'")
     local args = ParseQuotedArgs(msg)
-    
-    DEFAULT_CHAT_FRAME:AddMessage("MEPH DEBUG: Parsed args: [1]='" .. (args[1] or "nil") .. "' [2]='" .. (args[2] or "nil") .. "' [3]='" .. (args[3] or "nil") .. "' [4]='" .. (args[4] or "nil") .. "'")
-    
-    if args[1] == "target" and args[2] and args[3] and args[4] then
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH DEBUG: Calling AddTargetConfig")
-        AddTargetConfig(args[2], args[3], args[4])
+
+    if args[1] == "debug" then
+        -- Toggle debug mode
+        if MephDB.debug then
+            -- Turn OFF
+            MephDB.debug = false
+            if debugWindow then
+                debugWindow:Hide()
+            end
+            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Debug mode OFF")
+        else
+            -- Turn ON
+            MephDB.debug = true
+            CreateDebugWindow()
+            if debugWindow then
+                -- Update with any messages that were logged while window was closed
+                if debugEditBox and debugText ~= "" then
+                    debugEditBox:SetText(debugText)
+                    local scrollFrame = debugEditBox:GetParent()
+                    if scrollFrame then
+                        scrollFrame:UpdateScrollChildRect()
+                        local maxScroll = scrollFrame:GetVerticalScrollRange()
+                        if maxScroll and maxScroll > 0 then
+                            scrollFrame:SetVerticalScroll(maxScroll)
+                        end
+                    end
+                end
+                debugWindow:Show()
+            end
+            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Debug mode ON (window opened)")
+        end
+
+    elseif args[1] == "add" and args[2] and args[3] and args[4] then
+        -- /meph add "Livinport" "Frostbolt" "Frostbolt"
+        local newTarget = {
+            caster = args[2],
+            spell = args[3],
+            debuff = args[4]
+        }
+        table.insert(MephDB.targets, newTarget)
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Added target: " .. args[2] .. " -> " .. args[3] .. " -> " .. args[4])
+
     elseif args[1] == "remove" and args[2] then
-        RemoveTargetConfig(args[2])
+        local idx = tonumber(args[2])
+        if idx and idx > 0 and idx <= table.getn(MephDB.targets) then
+            local removed = MephDB.targets[idx]
+            table.remove(MephDB.targets, idx)
+            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Removed: " .. removed.caster .. " -> " .. removed.spell)
+        else
+            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Invalid index. Use /meph list to see targets")
+        end
+
     elseif args[1] == "list" then
-        ListTargetConfigs()
-    elseif args[1] == "wait" and args[2] then
-        if not addonLoaded then
-            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Addon not fully loaded yet. Please wait.")
-            return
-        end
-        local newWait = tonumber(args[2])
-        if newWait and newWait > 0 and newWait <= 3 then
-            GRACE_PERIOD = newWait
-            MephDB.settings.GRACE_PERIOD = newWait
-            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Grace period set to " .. newWait .. " seconds")
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Targets:")
+        if table.getn(MephDB.targets) == 0 then
+            DEFAULT_CHAT_FRAME:AddMessage("  (none)")
         else
-            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Invalid wait time. Use 0.1-3.0 seconds")
-        end
-    elseif args[1] == "emergency" and args[2] then
-        if not addonLoaded then
-            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Addon not fully loaded yet. Please wait.")
-            return
-        end
-        if args[2] == "reset" then
-            -- Remove the database override to use hardcoded default
-            MephDB.settings.EMERGENCY_RESTORE_TIME = nil
-            -- Reset to hardcoded default (reload the settings)
-            LoadSettings()
-            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Emergency restore time reset to default (" .. EMERGENCY_RESTORE_TIME .. " seconds)")
-        else
-            local newTime = tonumber(args[2])
-            if newTime and newTime >= 5 and newTime <= 30 then
-                EMERGENCY_RESTORE_TIME = newTime
-                MephDB.settings.EMERGENCY_RESTORE_TIME = newTime
-                DEFAULT_CHAT_FRAME:AddMessage("MEPH: Emergency restore time set to " .. newTime .. " seconds")
-            else
-                DEFAULT_CHAT_FRAME:AddMessage("MEPH: Invalid emergency time. Use 5-30 seconds or 'reset'")
+            for i, config in ipairs(MephDB.targets) do
+                DEFAULT_CHAT_FRAME:AddMessage("  " .. i .. ". " .. config.caster .. " -> " .. config.spell .. " -> " .. config.debuff)
             end
         end
-    elseif args[1] == "debug" then
-        if not addonLoaded then
-            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Addon not fully loaded yet. Please wait.")
-            return
-        end
-        DEBUG_MODE = not DEBUG_MODE
-        MephDB.settings.DEBUG_MODE = DEBUG_MODE
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Debug mode " .. (DEBUG_MODE and "ON" or "OFF"))
+
     elseif args[1] == "test" then
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Testing cast detection...")
-        if targetConfigs[1] then
-            OnTargetCastDetected(targetConfigs[1])
-        end
-    elseif args[1] == "debuff" then
-        if currentConfig then
-            local hasDebuff = HasTargetDebuff(currentConfig.debuff)
-            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Has " .. currentConfig.debuff .. " debuff: " .. (hasDebuff and "YES" or "NO"))
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Testing with first config...")
+        if MephDB.targets[1] then
+            OnCastDetected(MephDB.targets[1])
         else
-            DEFAULT_CHAT_FRAME:AddMessage("MEPH: No active configuration")
+            DEFAULT_CHAT_FRAME:AddMessage("MEPH: No targets configured!")
         end
+
+    elseif args[1] == "testblock" then
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Testing block for 3 seconds...")
+        BlockKeys()
+        local timer = 0
+        local frame = CreateFrame("Frame")
+        frame:SetScript("OnUpdate", function()
+            timer = timer + arg1
+            if timer >= 3.0 then
+                StopBlocking()
+                DEFAULT_CHAT_FRAME:AddMessage("MEPH: Block test complete!")
+                frame:SetScript("OnUpdate", nil)
+            end
+        end)
+
     elseif args[1] == "reset" then
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Resetting all states...")
-        castInProgress = false
-        currentConfig = nil
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Resetting...")
+        StopBlocking()
+        RebindKeys()
+        activeConfig = nil
         if debuffScanFrame then
             debuffScanFrame:SetScript("OnUpdate", nil)
         end
-        RestoreMovementKeys()
-    elseif args[1] == "cleandups" then
-        if not addonLoaded then
-            DEFAULT_CHAT_FRAME:AddMessage("MEPH: Addon not fully loaded yet. Please wait.")
-            return
+        if emergencyTimer then
+            emergencyTimer:SetScript("OnUpdate", nil)
         end
-        -- Remove duplicate entries
-        local seen = {}
-        local cleaned = {}
-        for _, config in ipairs(targetConfigs) do
-            local key = config.caster .. "|" .. config.spell .. "|" .. config.debuff
-            if not seen[key] then
-                seen[key] = true
-                table.insert(cleaned, {
-                    caster = config.caster,
-                    spell = config.spell,
-                    debuff = config.debuff
-                })
-            end
-        end
-        targetConfigs = cleaned
-        -- Create a safe copy for MephDB
-        MephDB.targetConfigs = {}
-        for i, config in ipairs(cleaned) do
-            MephDB.targetConfigs[i] = {
-                caster = config.caster,
-                spell = config.spell,
-                debuff = config.debuff
-            }
-        end
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Cleaned duplicate entries")
-        ListTargetConfigs()
-    elseif args[1] == "status" then
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH STATUS:")
-        DEFAULT_CHAT_FRAME:AddMessage("  addonLoaded: " .. tostring(addonLoaded))
-        DEFAULT_CHAT_FRAME:AddMessage("  MephDB exists: " .. tostring(MephDB ~= nil))
-        if MephDB then
-            DEFAULT_CHAT_FRAME:AddMessage("  MephDB.settings exists: " .. tostring(MephDB.settings ~= nil))
-            DEFAULT_CHAT_FRAME:AddMessage("  MephDB.targetConfigs exists: " .. tostring(MephDB.targetConfigs ~= nil))
-        end
-        DEFAULT_CHAT_FRAME:AddMessage("  targetConfigs count: " .. tostring(table.getn(targetConfigs)))
+
     else
         DEFAULT_CHAT_FRAME:AddMessage("MEPH Commands:")
-        DEFAULT_CHAT_FRAME:AddMessage('/meph target "caster" "spell" "debuff" - Add target')
-        DEFAULT_CHAT_FRAME:AddMessage("/meph remove <index> - Remove target by index")
-        DEFAULT_CHAT_FRAME:AddMessage("/meph list - List targets")
-        DEFAULT_CHAT_FRAME:AddMessage("/meph wait <seconds> - Set grace period")
-        DEFAULT_CHAT_FRAME:AddMessage("/meph emergency <seconds> - Set emergency restore time (5-30s)")
-        DEFAULT_CHAT_FRAME:AddMessage("/meph emergency reset - Reset emergency time to default")
-        DEFAULT_CHAT_FRAME:AddMessage("/meph debug - Toggle debug")
-        DEFAULT_CHAT_FRAME:AddMessage("/meph test - Test detection")
-        DEFAULT_CHAT_FRAME:AddMessage("/meph debuff - Check debuff")
-        DEFAULT_CHAT_FRAME:AddMessage("/meph reset - Reset all")
-        DEFAULT_CHAT_FRAME:AddMessage("/meph cleandups - Remove duplicate entries")
-        DEFAULT_CHAT_FRAME:AddMessage("/meph status - Show addon status")
-        DEFAULT_CHAT_FRAME:AddMessage("NOTE: All settings are automatically saved!")
+        DEFAULT_CHAT_FRAME:AddMessage('  /meph add "caster" "spell" "debuff" - Add target')
+        DEFAULT_CHAT_FRAME:AddMessage("  /meph remove <index> - Remove target")
+        DEFAULT_CHAT_FRAME:AddMessage("  /meph list - List targets")
+        DEFAULT_CHAT_FRAME:AddMessage("  /meph test - Test with first target")
+        DEFAULT_CHAT_FRAME:AddMessage("  /meph testblock - Test blocking for 3 seconds")
+        DEFAULT_CHAT_FRAME:AddMessage("  /meph debug - Toggle debug window")
+        DEFAULT_CHAT_FRAME:AddMessage("  /meph reset - Emergency reset")
     end
 end
 
--- Event frame with safe handling
-local frame = CreateFrame("Frame", "MephEventFrame")
+-- Event registration
+local eventFrame = CreateFrame("Frame")
+eventFrame:RegisterEvent("ADDON_LOADED")
+eventFrame:RegisterEvent("CHAT_MSG_SPELL_CREATURE_VS_CREATURE_DAMAGE")
+eventFrame:RegisterEvent("CHAT_MSG_SPELL_HOSTILEPLAYER_DAMAGE")
+eventFrame:RegisterEvent("CHAT_MSG_SPELL_FRIENDLYPLAYER_DAMAGE")
+eventFrame:RegisterEvent("CHAT_MSG_SPELL_PARTY_DAMAGE")
+eventFrame:RegisterEvent("CHAT_MSG_SPELL_SELF_DAMAGE")
+eventFrame:RegisterEvent("CHAT_MSG_MONSTER_EMOTE")
+eventFrame:RegisterEvent("CHAT_MSG_RAID_BOSS_EMOTE")
 
--- Event handler function
-local function MephEventHandler()
-    if not event or not arg1 then return end
-    
+eventFrame:SetScript("OnEvent", function()
     if event == "ADDON_LOADED" and arg1 == "meph" then
-        -- Protect against multiple loads
-        if addonLoaded then return end
-        
-        LoadSettings()  -- Load saved settings
-        addonLoaded = true  -- Mark addon as fully loaded
-        
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Loaded successfully!")
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Emergency time " .. EMERGENCY_RESTORE_TIME .. " seconds")
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Type /meph for settings")
-        StoreOriginalBindings()
+        InitializeDB()
+        Debug("MEPH addon loaded! Type /meph for help")
     else
-        -- Only handle chat messages if addon is loaded
-        if addonLoaded then
-            OnChatMessage(event, arg1)
-        end
+        OnChatEvent(event, arg1)
     end
-end
-
--- Register events
-frame:RegisterEvent("ADDON_LOADED")
-frame:RegisterEvent("CHAT_MSG_SPELL_CREATURE_VS_CREATURE_DAMAGE")
-frame:RegisterEvent("CHAT_MSG_SPELL_HOSTILEPLAYER_DAMAGE") 
-frame:RegisterEvent("CHAT_MSG_SPELL_FRIENDLYPLAYER_DAMAGE")
-frame:RegisterEvent("CHAT_MSG_SPELL_PARTY_DAMAGE")
-frame:RegisterEvent("CHAT_MSG_SPELL_SELF_DAMAGE")
-frame:RegisterEvent("CHAT_MSG_COMBAT_CREATURE_VS_CREATURE")
-frame:RegisterEvent("CHAT_MSG_COMBAT_HOSTILEPLAYER_VS_PLAYER")
-frame:RegisterEvent("CHAT_MSG_COMBAT_FRIENDLYPLAYER_VS_PLAYER")
-frame:RegisterEvent("CHAT_MSG_COMBAT_PARTY_VS_CREATURE")
-frame:RegisterEvent("CHAT_MSG_RAID_BOSS_EMOTE")
-frame:RegisterEvent("CHAT_MSG_MONSTER_EMOTE")
-
-frame:SetScript("OnEvent", MephEventHandler)
+end)
