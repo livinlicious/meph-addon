@@ -16,9 +16,23 @@ MephDB = MephDB or {}
 local function InitializeDB()
     if not MephDB.targets then
         MephDB.targets = {
-            {caster = "Mephistroth", spell = "Shackles of the Legion", debuff = "Shackles of the Legion"}
+            {
+                caster = "Mephistroth", 
+                spell = "Shackles of the Legion", 
+                debuff = "Shackles of the Legion",
+                scanDuration = 5.0 -- Covers 3s cast + 2s buffer
+            }
         }
     end
+    -- Backward compatibility for existing DB
+    if MephDB.targets then
+        for _, target in ipairs(MephDB.targets) do
+            if not target.scanDuration then
+                target.scanDuration = 5.0
+            end
+        end
+    end
+
     if not MephDB.emergency_time then
         MephDB.emergency_time = 12.0
     end
@@ -300,12 +314,13 @@ local function HasDebuff(name)
 end
 
 -- Scan for debuff and rebind when gone
-local function StartDebuffScan(debuffName)
+local function StartDebuffScan(debuffName, maxDuration)
     if debuffScanFrame then
         debuffScanFrame:SetScript("OnUpdate", nil)
     end
-
-    Debug("Starting debuff scan for: " .. debuffName)
+    
+    local limit = maxDuration or 5.0
+    Debug("Starting debuff scan for: " .. debuffName .. " (limit: " .. limit .. "s)")
 
     local scanTimer = 0
     local debuffFound = false
@@ -343,8 +358,8 @@ local function StartDebuffScan(debuffName)
                     end
                     Debug("Debuff scan cleanup complete")
                 else
-                    -- Never found debuff - timeout after 2 seconds
-                    if elapsed >= 2.0 then
+                    -- Never found debuff - timeout after specified duration (limit)
+                    if elapsed >= limit then
                         Debug("Debuff NEVER FOUND - timeout after " .. string.format("%.1f", elapsed) .. "s (resisted?)")
                         RebindKeys()
                         debuffScanFrame:SetScript("OnUpdate", nil)
@@ -468,7 +483,7 @@ local function OnCastDetected(config)
     end)
 
     -- Start scanning for debuff (will rebind when debuff expires)
-    StartDebuffScan(config.debuff)
+    StartDebuffScan(config.debuff, config.scanDuration)
 
     -- Start emergency timer
     StartEmergencyTimer()
@@ -569,14 +584,15 @@ SlashCmdList["MEPH"] = function(msg)
         end
 
     elseif args[1] == "add" and args[2] and args[3] and args[4] then
-        -- /meph add "Livinport" "Frostbolt" "Frostbolt"
+        -- /meph add "Livinport" "Frostbolt" "Frostbolt" [duration]
         local newTarget = {
             caster = args[2],
             spell = args[3],
-            debuff = args[4]
+            debuff = args[4],
+            scanDuration = tonumber(args[5]) or 5.0
         }
         table.insert(MephDB.targets, newTarget)
-        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Added target: " .. args[2] .. " -> " .. args[3] .. " -> " .. args[4])
+        DEFAULT_CHAT_FRAME:AddMessage("MEPH: Added target: " .. args[2] .. " -> " .. args[3] .. " -> " .. args[4] .. " (timeout: " .. newTarget.scanDuration .. "s)")
 
     elseif args[1] == "remove" and args[2] then
         local idx = tonumber(args[2])
